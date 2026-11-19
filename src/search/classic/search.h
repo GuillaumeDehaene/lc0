@@ -303,6 +303,13 @@ class SearchWorker {
   void UpdateCounters();
 
  private:
+  // Child look-ahead: a child adjudicated at its parent's expansion.
+  struct LookaheadResult {
+    Move move;           // As in the parent's edge list.
+    GameResult result;   // From the view of the player making `move`.
+    Node::Terminal type;
+  };
+
   struct NodeToProcess {
     bool IsExtendable() const { return !is_collision && !node->IsTerminal(); }
     bool IsCollision() const { return is_collision; }
@@ -324,6 +331,8 @@ class SearchWorker {
     bool is_collision = false;
     // Only populated for visits,
     std::vector<Move> moves_to_visit;
+    // Child look-ahead results, applied once the policy is known.
+    std::vector<LookaheadResult> lookahead;
 
     // Details that are filled in as we go.
     bool ooo_completed = false;
@@ -413,10 +422,27 @@ class SearchWorker {
                              std::vector<NodeToProcess>* receiver,
                              TaskWorkspace* workspace);
   void EnsureNodeTwoFoldCorrectForDepth(Node* node, int depth);
+  // Returns q clamped to the child's proven bounds.
+  static float ClampQToBounds(const Node* child, float q, float draw_score);
+  // Child look-ahead: adjudicates the children of `parent` without the NN.
+  void LookaheadChildren(const Position& parent, const MoveList& moves,
+                         std::vector<LookaheadResult>* out);
+  // Child look-ahead: creates the adjudicated children as terminal N=0 nodes.
+  // Must run after the node's edges are sorted (policy received).
+  void ApplyLookahead(NodeToProcess* node_to_process);
+  // Child look-ahead: if the adjudicated children prove `node` (a winning
+  // move, or every move adjudicated), makes it terminal and returns true.
+  // Never called on the root.
+  bool ProveFromLookahead(Node* node, const MoveList& legal_moves,
+                          const std::vector<LookaheadResult>& results);
+  // Child look-ahead at the root: backs up one visit to a winning root child,
+  // so that best-move ranking (which needs N > 0) sees it.
+  void VisitRootLookaheadWin(const NodeToProcess& node_to_process);
   void ProcessPickedTask(int batch_start, int batch_end,
                          TaskWorkspace* workspace);
   void ExtendNode(Node* node, int depth, const std::vector<Move>& moves_to_add,
-                  PositionHistory* history);
+                  PositionHistory* history,
+                  std::vector<LookaheadResult>* lookahead);
   void FetchSingleNodeResult(NodeToProcess* node_to_process);
   void RunTasks(int tid);
   void ResetTasks();

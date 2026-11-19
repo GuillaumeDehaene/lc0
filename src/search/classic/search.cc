@@ -427,6 +427,18 @@ float Search::GetDrawScore(bool is_odd_depth) const {
 }
 
 namespace {
+// Value of a proven bound, on the same scale as Node::GetQ(draw_score).
+float BoundToQ(GameResult bound, float draw_score) {
+  switch (bound) {
+    case GameResult::BLACK_WON:
+      return -1.0f;
+    case GameResult::DRAW:
+      return draw_score;
+    default:
+      return 1.0f;
+  }
+}
+
 inline float GetFpu(const SearchParams& params, const Node* node, bool is_root_node,
                     float draw_score) {
   const auto value = params.GetFpuValue(is_root_node);
@@ -1445,7 +1457,8 @@ void SearchWorker::ProcessPickedTask(int start_idx, int end_idx,
     // of the game), it means that we already visited this node before.
     if (picked_node.IsExtendable()) {
       // Node was never visited, extend it.
-      ExtendNode(node, picked_node.depth, picked_node.moves_to_visit, &history);
+      ExtendNode(node, picked_node.depth, picked_node.moves_to_visit, &history,
+                 &picked_node.lookahead);
       if (!node->IsTerminal()) {
         picked_node.nn_queried = true;
         MoveList legal_moves;
@@ -1556,6 +1569,18 @@ void SearchWorker::EnsureNodeTwoFoldCorrectForDepth(Node* child_node,
     // cum_depth_ only counts the average depth of new nodes, not reused
     // ones.
   }
+}
+
+float SearchWorker::ClampQToBounds(const Node* child, float q,
+                                   float draw_score) {
+  const auto [lower, upper] = child->GetBounds();
+  if (lower == GameResult::BLACK_WON && upper == GameResult::WHITE_WON) {
+    return q;  // Regular node, nothing proven.
+  }
+  if (child->IsTerminal()) return q;  // Q already exact.
+  const float lo = BoundToQ(lower, draw_score);
+  const float hi = BoundToQ(upper, draw_score);
+  return std::clamp(q, lo, hi);
 }
 
 void SearchWorker::PickNodesToExtendTask(
@@ -1675,13 +1700,6 @@ void SearchWorker::PickNodesToExtendTask(
       // visited policy without having to cache it in the node (allowing the
       // node to stay at 64 bytes).
       int max_needed = node->GetNumEdges();
-      if (!is_root_node || root_move_filter.empty()) {
-        max_needed = std::min(max_needed, node->GetNStarted() + cur_limit + 2);
-      }
-      node->CopyPolicy(max_needed, current_pol.data());
-      for (int i = 0; i < max_needed; i++) {
-        current_util[i] = std::numeric_limits<float>::lowest();
-      }
       // Root depth is 1 here, while for GetDrawScore() it's 0-based, that's why
       // the weirdness.
       const float draw_score = ((current_path.size() + base_depth) % 2 == 0)
@@ -1689,11 +1707,38 @@ void SearchWorker::PickNodesToExtendTask(
                                    : even_draw_score;
       m_evaluator.SetParent(node);
       float visited_pol = 0.0f;
-      for (Node* child : node->VisitedNodes()) {
-        int index = child->Index();
-        visited_pol += current_pol[index];
-        float q = child->GetQ(draw_score);
-        current_util[index] = q + m_evaluator.GetMUtility(child, q);
+      // With the child look-ahead, a node can have terminal children anywhere
+      // in its (policy sorted) edge list, visited or not. The usual shortcuts
+      // (only look at the first NStarted+limit+2 edges, VisitedNodes()
+      // stopping at the first never-started child, stopping the scan after 2
+      // unvisited edges) assume that visited children form a prefix of the
+      // edge list, so they are disabled for such nodes.
+      bool full_scan = false;
+      node->CopyPolicy(max_needed, current_pol.data());
+      for (int i = 0; i < max_needed; i++) {
+        current_util[i] = std::numeric_limits<float>::lowest();
+      }
+      int index = -1;
+      for (auto& edge : node->Edges()) {
+        ++index;
+        Node* child = edge.node();
+        if (child == nullptr) continue;
+        if (child->GetN() > 0) {
+          visited_pol += current_pol[index];
+          float q = child->GetQ(draw_score);
+          q = ClampQToBounds(child, q, draw_score);
+          current_util[index] = q + m_evaluator.GetMUtility(child, q);
+          if (child->IsTerminal()) full_scan = true;
+        } else if (child->IsTerminal() && child->GetNInFlight() == 0) {
+          // Adjudicated at expansion, never visited: use the exact value
+          // instead of FPU.
+          const float q = child->GetQ(draw_score);
+          current_util[index] = q + m_evaluator.GetMUtility(child, q);
+          full_scan = true;
+        }
+      }
+      if (!full_scan && (!is_root_node || root_move_filter.empty())) {
+        max_needed = std::min(max_needed, node->GetNStarted() + cur_limit + 2);
       }
       const float fpu =
           GetFpu(params_, node, is_root_node, draw_score, visited_pol);
@@ -1764,7 +1809,7 @@ void SearchWorker::PickNodesToExtendTask(
             second_best_edge = cur_iters[idx];
           }
           if (can_exit) break;
-          if (nstarted == 0) {
+          if (nstarted == 0 && !full_scan) {
             // One more loop will get 2 unvisited nodes, which is sufficient to
             // ensure second best is correct. This relies upon the fact that
             // edges are sorted in policy decreasing order.
@@ -1908,7 +1953,8 @@ void SearchWorker::PickNodesToExtendTask(
 
 void SearchWorker::ExtendNode(Node* node, int depth,
                               const std::vector<Move>& moves_to_node,
-                              PositionHistory* history) {
+                              PositionHistory* history,
+                              std::vector<LookaheadResult>* lookahead) {
   // Initialize position sequence with pre-move position.
   history->Trim(search_->played_history_.GetLength());
   for (size_t i = 0; i < moves_to_node.size(); i++) {
@@ -1999,8 +2045,147 @@ void SearchWorker::ExtendNode(Node* node, int depth,
     }
   }
 
+  // Child look-ahead: adjudicate the children now (CPU only). If they prove
+  // this node, it becomes terminal here (no NN eval, no edges), like a TB hit.
+  // Otherwise the results are applied once the policy has arrived and edges
+  // are sorted.
+  lookahead->clear();
+  LookaheadChildren(history->Last(), legal_moves, lookahead);
+  if (node != search_->root_node_ &&
+      ProveFromLookahead(node, legal_moves, *lookahead)) {
+    lookahead->clear();
+    return;
+  }
+
   // Add legal moves as edges of this node.
   node->CreateEdges(legal_moves);
+}
+
+void SearchWorker::LookaheadChildren(const Position& parent,
+                                     const MoveList& moves,
+                                     std::vector<LookaheadResult>* out) {
+  SyzygyTablebase* tb =
+      search_->root_is_in_dtz_ ? nullptr : search_->syzygy_tb_;
+  const int tb_cardinality = tb ? tb->max_cardinality() : 0;
+  for (const Move move : moves) {
+    const Position child(parent, move);
+    const auto& board = child.GetBoard();
+    // Same order as ExtendNode: by-position first (mate beats 50-move rule).
+    if (board.GenerateLegalMoves().empty()) {
+      if (board.IsUnderCheck()) {
+        out->push_back(
+            {move, GameResult::WHITE_WON, Node::Terminal::EndOfGame});
+      } else {
+        out->push_back({move, GameResult::DRAW, Node::Terminal::EndOfGame});
+      }
+      continue;
+    }
+    if (!board.HasMatingMaterial()) {
+      out->push_back({move, GameResult::DRAW, Node::Terminal::EndOfGame});
+      continue;
+    }
+    if (child.GetRule50Ply() >= 100) {
+      out->push_back({move, GameResult::DRAW, Node::Terminal::EndOfGame});
+      continue;
+    }
+    // Repetitions are path dependent: left to ExtendNode.
+    if (tb && child.GetRule50Ply() == 0 &&
+        board.castlings().no_legal_castle() &&
+        static_cast<int>((board.ours() | board.theirs()).count()) <=
+            tb_cardinality) {
+      ProbeState state;
+      const WDLScore wdl = tb->probe_wdl(child, &state);
+      if (state == FAIL) continue;
+      search_->tb_hits_.fetch_add(1, std::memory_order_acq_rel);
+      // wdl is from the child's side to move, i.e. the opponent of the player
+      // making `move` (same convention as in ExtendNode).
+      if (wdl == WDL_WIN) {
+        out->push_back(
+            {move, GameResult::BLACK_WON, Node::Terminal::Tablebase});
+      } else if (wdl == WDL_LOSS) {
+        out->push_back(
+            {move, GameResult::WHITE_WON, Node::Terminal::Tablebase});
+      } else {
+        out->push_back({move, GameResult::DRAW, Node::Terminal::Tablebase});
+      }
+    }
+  }
+}
+
+bool SearchWorker::ProveFromLookahead(
+    Node* node, const MoveList& legal_moves,
+    const std::vector<LookaheadResult>& results) {
+  // Proving a node from its children is what sticky endgames do.
+  if (!params_.GetStickyEndgames()) return false;
+  // Results are from the view of the player to move at `node`.
+  const LookaheadResult* win = nullptr;
+  bool any_draw = false;
+  bool any_tb = false;
+  for (const auto& r : results) {
+    if (r.type == Node::Terminal::Tablebase) any_tb = true;
+    if (r.result == GameResult::WHITE_WON) {
+      // Prefer a checkmate over a tablebase win (as MaybeSetBounds does).
+      if (win == nullptr || (win->type == Node::Terminal::Tablebase &&
+                             r.type != Node::Terminal::Tablebase)) {
+        win = &r;
+      }
+    } else if (r.result == GameResult::DRAW) {
+      any_draw = true;
+    }
+  }
+  const bool all_adjudicated = results.size() == legal_moves.size();
+  if (win == nullptr && !all_adjudicated) return false;
+
+  // Plies left: as ExtendNode does for TB nodes (parent's M minus one); 1 for
+  // a mate in one.
+  float tb_m = 0.0f;
+  {
+    SharedMutex::SharedLock lock(search_->nodes_mutex_);
+    if (const Node* parent = node->GetParent()) {
+      tb_m = std::max(0.0f, parent->GetM() - 1.0f);
+    }
+  }
+  // The node's value is from the view of the player who moved into it.
+  GameResult value;
+  Node::Terminal type;
+  float m;
+  if (win != nullptr) {
+    value = GameResult::BLACK_WON;
+    type = win->type == Node::Terminal::Tablebase ? Node::Terminal::Tablebase
+                                                  : Node::Terminal::EndOfGame;
+    m = win->type == Node::Terminal::Tablebase ? tb_m : 1.0f;
+  } else if (any_draw) {
+    value = GameResult::DRAW;
+    type = any_tb ? Node::Terminal::Tablebase : Node::Terminal::EndOfGame;
+    m = tb_m;
+  } else {
+    // Every move loses for the player to move: only TB results are losses.
+    value = GameResult::WHITE_WON;
+    type = Node::Terminal::Tablebase;
+    m = tb_m;
+  }
+  node->MakeTerminal(value, m, type);
+  return true;
+}
+
+void SearchWorker::ApplyLookahead(NodeToProcess* node_to_process) {
+  Node* node = node_to_process->node;
+  // Plies left for TB children, as ExtendNode does for TB nodes (parent's M
+  // minus one); the parent's M is the NN's estimate just received.
+  const float tb_m = std::max(0.0f, node_to_process->eval->m - 1.0f);
+  for (const auto& result : node_to_process->lookahead) {
+    for (auto& edge : node->Edges()) {
+      if (edge.GetMove() != result.move) continue;
+      // Safe without the tree lock: `node` has N=0 and a visit in flight, so
+      // no other thread descends into it or makes its parent solid.
+      Node* child = edge.GetOrSpawnNode(/* parent */ node);
+      child->MakeTerminal(
+          result.result,
+          result.type == Node::Terminal::Tablebase ? tb_m : 0.0f,
+          result.type);
+      break;
+    }
+  }
 }
 
 // 2b. Copy collisions into shared collisions.
@@ -2181,6 +2366,7 @@ void SearchWorker::FetchSingleNodeResult(NodeToProcess* node_to_process) {
                         params_.GetNoiseAlpha());
   }
   node->SortEdges();
+  if (!node_to_process->lookahead.empty()) ApplyLookahead(node_to_process);
 }
 
 // 6. Propagate the new nodes' information to all their parents in the tree.
@@ -2213,6 +2399,13 @@ void SearchWorker::DoBackupUpdateSingleNode(
   // For the first visit to a terminal, maybe update parent bounds too.
   auto update_parent_bounds =
       params_.GetStickyEndgames() && node->IsTerminal() && !node->GetN();
+  // Child look-ahead, unproven expansion: the adjudicated children (N=0) set
+  // this node's own bounds right after its first backup. They can't prove it
+  // (ProveFromLookahead would have), so no value changes here.
+  const bool lookahead_bounds = params_.GetStickyEndgames() &&
+                                !node_to_process.lookahead.empty() &&
+                                !node->IsTerminal() &&
+                                node != search_->root_node_;
 
   // Backup V value up to a root. After 1 visit, V = Q.
   float v = node_to_process.eval->q;
@@ -2245,6 +2438,13 @@ void SearchWorker::DoBackupUpdateSingleNode(
         search_->current_best_edge_ =
             search_->GetBestChildNoTemperature(search_->root_node_, 0);
       }
+    }
+
+    if (lookahead_bounds && n == node) {
+      int fix = 0;
+      float dv = 0.0f, dd = 0.0f, dm = 0.0f;
+      update_parent_bounds = MaybeSetBounds(node, m, &fix, &dv, &dd, &dm);
+      assert(fix == 0);
     }
 
     // Nothing left to do without ancestors to update.
@@ -2285,6 +2485,42 @@ void SearchWorker::DoBackupUpdateSingleNode(
   }
   search_->cum_depth_ += node_to_process.depth * node_to_process.multivisit;
   search_->max_depth_ = std::max(search_->max_depth_, node_to_process.depth);
+
+  if (node == search_->root_node_ && !node_to_process.lookahead.empty()) {
+    VisitRootLookaheadWin(node_to_process);
+  }
+}
+
+void SearchWorker::VisitRootLookaheadWin(
+    const NodeToProcess& node_to_process) REQUIRES(search_->nodes_mutex_) {
+  Node* root = node_to_process.node;
+  const LookaheadResult* win = nullptr;
+  for (const auto& r : node_to_process.lookahead) {
+    if (r.result != GameResult::WHITE_WON) continue;
+    if (win == nullptr || (win->type == Node::Terminal::Tablebase &&
+                           r.type != Node::Terminal::Tablebase)) {
+      win = &r;
+    }
+  }
+  if (win == nullptr) return;
+  Node* child = nullptr;
+  for (auto& edge : root->Edges()) {
+    if (edge.GetMove() == win->move) {
+      child = edge.node();
+      break;
+    }
+  }
+  if (child == nullptr || !child->IsTerminal() || child->GetN() > 0 ||
+      !child->TryStartScoreUpdate()) {
+    return;
+  }
+  // Same bookkeeping as a visit picked by selection.
+  root->IncrementNInFlight(1);
+  NodeToProcess visit = NodeToProcess::Visit(child, node_to_process.depth + 1);
+  visit.eval->q = child->GetWL();
+  visit.eval->d = child->GetD();
+  visit.eval->m = child->GetM();
+  DoBackupUpdateSingleNode(visit);
 }
 
 bool SearchWorker::MaybeSetBounds(Node* p, float m, int* n_to_fix,
