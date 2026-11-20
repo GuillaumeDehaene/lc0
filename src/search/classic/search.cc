@@ -1726,7 +1726,8 @@ void SearchWorker::PickNodesToExtendTask(
         if (child->GetN() > 0) {
           visited_pol += current_pol[index];
           float q = child->GetQ(draw_score);
-          q = ClampQToBounds(child, q, draw_score);
+          // Bounds-aware Q disabled for an Elo test.
+          if (false) q = ClampQToBounds(child, q, draw_score);
           current_util[index] = q + m_evaluator.GetMUtility(child, q);
           if (child->IsTerminal()) full_scan = true;
         } else if (child->IsTerminal() && child->GetNInFlight() == 0) {
