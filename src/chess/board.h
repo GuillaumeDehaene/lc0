@@ -105,6 +105,9 @@ class ChessBoard {
   bool HasMatingMaterial() const;
   // Generates legal moves.
   MoveList GenerateLegalMoves() const;
+  // Whether "ours" has at least one legal move. Stops the legality filtering
+  // at the first legal move found.
+  bool HasLegalMove() const;
   // Check whether pseudolegal move is legal.
   bool IsLegalMove(Move move, const KingAttackInfo& king_attack_info) const;
 

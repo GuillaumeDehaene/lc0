@@ -955,6 +955,14 @@ MoveList ChessBoard::GenerateLegalMoves() const {
   return result;
 }
 
+bool ChessBoard::HasLegalMove() const {
+  const KingAttackInfo king_attack_info = GenerateKingAttackInfo();
+  const MoveList moves = GeneratePseudolegalMoves();
+  return std::any_of(moves.begin(), moves.end(), [&](Move m) {
+    return IsLegalMove(m, king_attack_info);
+  });
+}
+
 void ChessBoard::PutPiece(Square square, PieceType piece, bool is_theirs) {
   (is_theirs ? their_pieces_ : our_pieces_).set(square);
   if (piece == kKing) (is_theirs ? their_king_ : our_king_) = square;

@@ -2067,29 +2067,42 @@ void SearchWorker::LookaheadChildren(const Position& parent,
   SyzygyTablebase* tb =
       search_->root_is_in_dtz_ ? nullptr : search_->syzygy_tb_;
   const int tb_cardinality = tb ? tb->max_cardinality() : 0;
+  const auto& parent_board = parent.GetBoard();
+  const int parent_pieces =
+      static_cast<int>((parent_board.ours() | parent_board.theirs()).count());
+  // A child can only reach a 50-move draw if the parent is at >= 99 plies.
+  const bool check_rule50 = parent.GetRule50Ply() >= 99;
+  // A capture removes at most one piece: no child can be in the TB otherwise.
+  const bool may_probe_tb = tb && parent_pieces - 1 <= tb_cardinality;
   for (const Move move : moves) {
+    // Only captures and pawn moves (including en passant and promotions)
+    // zero the 50-move counter. Other moves leave the material unchanged, so
+    // neither the TB nor the insufficient-material test can newly apply.
+    const bool zeroing = parent_board.theirs().get(move.to()) ||
+                         parent_board.pawns().get(move.from());
+    // A zeroing move is needed for the material tests, a non-zeroing one for
+    // the 50-move rule. Otherwise no test can apply: skip building the child.
+    if (!zeroing && !check_rule50) continue;
     const Position child(parent, move);
     const auto& board = child.GetBoard();
-    // Same order as ExtendNode: by-position first (mate beats 50-move rule).
-    if (board.GenerateLegalMoves().empty()) {
-      if (board.IsUnderCheck()) {
-        out->push_back(
-            {move, GameResult::WHITE_WON, Node::Terminal::EndOfGame});
-      } else {
-        out->push_back({move, GameResult::DRAW, Node::Terminal::EndOfGame});
-      }
+    // Checkmate and stalemate are not looked for here (legal move generation
+    // is too costly per child): they are found when the child is expanded in
+    // ExtendNode.
+    if (check_rule50 && child.GetRule50Ply() >= 100) {
+      // Mate beats the 50-move rule, so this one case needs the mate test.
+      const bool mate = board.IsUnderCheck() && !board.HasLegalMove();
+      out->push_back({move, mate ? GameResult::WHITE_WON : GameResult::DRAW,
+                      Node::Terminal::EndOfGame});
       continue;
     }
-    if (!board.HasMatingMaterial()) {
-      out->push_back({move, GameResult::DRAW, Node::Terminal::EndOfGame});
-      continue;
-    }
-    if (child.GetRule50Ply() >= 100) {
+    // A zeroing move cannot end in a 50-move draw, so the order between this
+    // and the check above does not matter.
+    if (zeroing && !board.HasMatingMaterial()) {
       out->push_back({move, GameResult::DRAW, Node::Terminal::EndOfGame});
       continue;
     }
     // Repetitions are path dependent: left to ExtendNode.
-    if (tb && child.GetRule50Ply() == 0 &&
+    if (may_probe_tb && zeroing &&
         board.castlings().no_legal_castle() &&
         static_cast<int>((board.ours() | board.theirs()).count()) <=
             tb_cardinality) {
